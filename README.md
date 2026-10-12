@@ -29,7 +29,7 @@ WINEDLLOVERRIDES="dxgi=n,b" %command%
 - If something breaks, check `th06nc-tate-log.txt` in the game folder.
 
 ## Notes
-- As of now, from my testing, Special K does not work with this mod. I may try to fix it in the future.
+- As of now, from my testing, SpecialK does not work with this mod. I may try to fix it in the future.
 - Borderless windowed and fullscreen both work on a horizontal 16:9 desktop. On a vertical desktop, use fullscreen; borderless windowed is glitched there.
 
 ## Building

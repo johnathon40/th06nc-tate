@@ -1,0 +1,4 @@
+build/
+dxgi.dll
+release/
+*.zip

@@ -5,7 +5,7 @@ THRotator-style tate mod for Touhou Koumakyou: New Classic ~ the Embodiment of S
 
 ## Installation
 1. Download the latest release zip.
-2. Copy `dxgi.dll`, `th06nc-tate.ini` and `th06nc-tate-bg.bmp` into the game folder, next to `th06nc.exe` (Steam: right-click the game > Manage > Browse local files).
+2. Extract the zip into the game folder, next to `th06nc.exe` (Steam: right-click the game > Manage > Browse local files).
 
 ### Linux / Proton
 Also set the Steam launch options to:

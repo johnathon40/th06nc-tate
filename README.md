@@ -1,7 +1,7 @@
 # th06nc-tate
 THRotator-style tate mod for Touhou Koumakyou: New Classic ~ the Embodiment of Scarlet Devil
 
-![th06nc-tate in tate mode](screenshots/tate.png)
+<img src="screenshots/tate.png" width="360" alt="th06nc-tate in tate mode">
 
 ## Installation
 1. Download the latest release zip.

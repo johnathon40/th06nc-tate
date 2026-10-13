@@ -155,10 +155,10 @@ static void resetDefaults() {
         { 1950, 620, 560, 62, 8, 62, 506, 56 },       // graze
         { 1950, 695, 560, 62, 524, 62, 506, 56 },     // points
         { 2000, 56, 420, 74, 1040, 26, 392, 69 },     // difficulty (wide enough for LUNATIC)
-        { 1950, 340, 580, 78, 8, 1800, 505, 68 },     // player (tall enough for Infinite)
-        { 1950, 423, 580, 62, 540, 1807, 505, 54 },   // bomb
+        { 1950, 340, 590, 78, 8, 1800, 513, 68 },     // player (tall enough for Infinite, same width as power)
+        { 1950, 423, 552, 62, 540, 1807, 480, 54 },   // bomb (ends just after the last star)
         { 1950, 542, 590, 60, 8, 1868, 513, 52 },     // power
-        { 2260, 1388, 190, 44, 1250, 1870, 173, 40 }, // fps
+        { 2252, 1386, 179, 34, 1277, 1889, 163, 31 },  // fps (flush in the bottom-right corner)
     };
     EnterCriticalSection(&g_lock);
     g_numRects = sizeof(def) / sizeof(def[0]);
@@ -197,7 +197,7 @@ static void* patchVT(void* obj, int idx, void* fn) {
 }
 
 // ---------------------------------------------------------------- renderer state
-struct Vtx { float x, y, u, v, lx, ly, fx, fy; }; // pos, tex, local 0..1, feather (fraction of quad)
+struct Vtx { float x, y, u, v, lx, ly, fl, fr, ft, fb; }; // pos, tex, local 0..1, edge fade per side (fraction of quad)
 static const int kMaxVerts = (kMaxRects + 2) * 6;
 
 static ID3D11Device*             g_dev;
@@ -231,14 +231,16 @@ static UINT g_fakeW, g_fakeH;
 static bool g_initFailed;
 
 static const char kShader[] =
-    "struct VI{float2 p:POSITION;float2 t:TEXCOORD0;float2 l:TEXCOORD1;float2 f:TEXCOORD2;};"
-    "struct VO{float4 p:SV_Position;float2 t:TEXCOORD0;float2 l:TEXCOORD1;float2 f:TEXCOORD2;};"
+    "struct VI{float2 p:POSITION;float2 t:TEXCOORD0;float2 l:TEXCOORD1;float4 f:TEXCOORD2;};"
+    "struct VO{float4 p:SV_Position;float2 t:TEXCOORD0;float2 l:TEXCOORD1;float4 f:TEXCOORD2;};"
     "VO vs(VI i){VO o;o.p=float4(i.p,0,1);o.t=i.t;o.l=i.l;o.f=i.f;return o;}"
     "Texture2D tx:register(t0);SamplerState ss:register(s0);"
     "float4 ps(VO i):SV_Target{"
-    "float2 d=min(i.l,1-i.l);float a=1;"
-    "if(i.f.x>0)a*=smoothstep(0,1,saturate(d.x/i.f.x));"
-    "if(i.f.y>0)a*=smoothstep(0,1,saturate(d.y/i.f.y));"
+    "float a=1;"
+    "if(i.f.x>0)a*=smoothstep(0,1,saturate(i.l.x/i.f.x));"
+    "if(i.f.y>0)a*=smoothstep(0,1,saturate((1-i.l.x)/i.f.y));"
+    "if(i.f.z>0)a*=smoothstep(0,1,saturate(i.l.y/i.f.z));"
+    "if(i.f.w>0)a*=smoothstep(0,1,saturate((1-i.l.y)/i.f.w));"
     "return float4(tx.Sample(ss,i.t).rgb,a);}";
 
 static DXGI_FORMAT typedFormat(DXGI_FORMAT f) {
@@ -384,7 +386,7 @@ static void rebuildSampler() {
 
 static const char kOverlayPs[] =
     "Texture2D tx:register(t0);SamplerState ss:register(s0);"
-    "struct VO{float4 p:SV_Position;float2 t:TEXCOORD0;float2 l:TEXCOORD1;float2 f:TEXCOORD2;};"
+    "struct VO{float4 p:SV_Position;float2 t:TEXCOORD0;float2 l:TEXCOORD1;float4 f:TEXCOORD2;};"
     "float4 ps(VO i):SV_Target{return tx.Sample(ss,i.t);}";
 
 static bool initRenderer(ID3D11Device* dev) {
@@ -413,7 +415,7 @@ static bool initRenderer(ID3D11Device* dev) {
             { "POSITION", 0, DXGI_FORMAT_R32G32_FLOAT, 0, 0,  D3D11_INPUT_PER_VERTEX_DATA, 0 },
             { "TEXCOORD", 0, DXGI_FORMAT_R32G32_FLOAT, 0, 8,  D3D11_INPUT_PER_VERTEX_DATA, 0 },
             { "TEXCOORD", 1, DXGI_FORMAT_R32G32_FLOAT, 0, 16, D3D11_INPUT_PER_VERTEX_DATA, 0 },
-            { "TEXCOORD", 2, DXGI_FORMAT_R32G32_FLOAT, 0, 24, D3D11_INPUT_PER_VERTEX_DATA, 0 },
+            { "TEXCOORD", 2, DXGI_FORMAT_R32G32B32A32_FLOAT, 0, 24, D3D11_INPUT_PER_VERTEX_DATA, 0 },
         };
         ok = SUCCEEDED(dev->CreateInputLayout(ie, 4, vsb->GetBufferPointer(), vsb->GetBufferSize(), &g_il));
     }
@@ -671,13 +673,18 @@ static void toNdc(float u, float v, float* x, float* y) {
 static int pushQuad(Vtx* out, int n,
                     float s0, float t0, float s1, float t1,     // texture coords 0..1
                     float dx, float dy, float dw, float dh,     // dest, canvas pixels
-                    float fx = 0, float fy = 0) {               // edge fade, canvas pixels
+                    float fx = 0, float fy = 0,                 // edge fade, canvas pixels
+                    int noFade = 0) {                           // sides without fade: 1 left, 2 right, 4 top, 8 bottom
     if (n + 6 > kMaxVerts) return n;
     Vtx c[4];
     float ffx = (fx > 0 && dw > 0) ? fx / dw : 0, ffy = (fy > 0 && dh > 0) ? fy / dh : 0;
     if (ffx > 0.5f) ffx = 0.5f;
     if (ffy > 0.5f) ffy = 0.5f;
-    for (int i = 0; i < 4; i++) { c[i].lx = (float)(i & 1); c[i].ly = (float)(i >> 1); c[i].fx = ffx; c[i].fy = ffy; }
+    for (int i = 0; i < 4; i++) {
+        c[i].lx = (float)(i & 1); c[i].ly = (float)(i >> 1);
+        c[i].fl = (noFade & 1) ? 0 : ffx; c[i].fr = (noFade & 2) ? 0 : ffx;
+        c[i].ft = (noFade & 4) ? 0 : ffy; c[i].fb = (noFade & 8) ? 0 : ffy;
+    }
     toNdc(dx,      dy,      &c[0].x, &c[0].y); c[0].u = s0; c[0].v = t0;
     toNdc(dx + dw, dy,      &c[1].x, &c[1].y); c[1].u = s1; c[1].v = t0;
     toNdc(dx,      dy + dh, &c[2].x, &c[2].y); c[2].u = s0; c[2].v = t1;
@@ -713,7 +720,10 @@ static int buildQuads(Vtx* v, bool layout, int* bgVerts) {
                          tx0 + tsx * r.sx / g_refW, ty0 + tsy * r.sy / g_refH,
                          tx0 + tsx * (r.sx + r.sw) / g_refW, ty0 + tsy * (r.sy + r.sh) / g_refH,
                          ox + r.dx * k, oy + r.dy * k, r.dw * k, r.dh * k,
-                         i == 0 ? 0 : g_featherX * k, i == 0 ? 0 : g_featherY * k);
+                         i == 0 ? 0 : g_featherX * k, i == 0 ? 0 : g_featherY * k,
+                         // no fade on sides that sit on the layout's outer edge (keeps corner items flush)
+                         (r.dx <= 0 ? 1 : 0) | (r.dx + r.dw >= g_canW ? 2 : 0) |
+                         (r.dy <= 0 ? 4 : 0) | (r.dy + r.dh >= g_canH ? 8 : 0));
         }
     } else {
         // whole frame, rotated and fitted (menus)
@@ -1037,7 +1047,7 @@ static void overlayBuildUi() {
         ImGui::SameLine();
         if (ImGui::Button("Save")) { lstrcpyA(g_bgName, g_ovBgEdit); saveAll(); }
         ImGui::SameLine();
-        if (ImGui::Button("Version info")) ImGui::OpenPopup("version");
+        if (ImGui::Button("Info")) ImGui::OpenPopup("version");
         ImGui::SameLine();
         if (ImGui::Button("Reset to defaults")) ImGui::OpenPopup("reset");
         if (ImGui::BeginPopup("reset")) {

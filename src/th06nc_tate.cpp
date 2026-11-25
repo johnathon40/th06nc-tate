@@ -28,6 +28,7 @@ static int   g_autoDetect = 1;    // gameplay detection by the playfield frame
 static int   g_defaultLayout = 1; // used when auto detect is off
 static int   g_debug;
 static int   g_openAtStartCfg;
+static int   g_showFrame = 1;     // include the gold frame (boss radar) around the playfield
 static bool  g_ovVisible;         // in-game menu shown
 static int   g_force = -1;        // -1 none, 0 whole screen, 1 HUD layout (Alt+Up/Down, not saved)
 static int   g_featherX = 24, g_featherY = 10; // HUD edge fade, layout reference pixels
@@ -70,6 +71,7 @@ static void loadConfig() {
     g_screenShape = iniInt("General", "ScreenShape", 0);
     if (g_screenShape < 0 || g_screenShape > 2) g_screenShape = 0;
     g_openAtStartCfg = iniInt("General", "OpenAtStart", 0);
+    g_showFrame = iniInt("General", "ShowFrame", 1);
     g_refW = iniInt("Layout", "RefWidth", 2560);
     g_refH = iniInt("Layout", "RefHeight", 1440);
     g_canW = iniInt("Layout", "CanvasWidth", 1440);
@@ -130,6 +132,7 @@ static void saveAll() {
     writeIntKey("General", "Rotation", g_rotation);
     writeIntKey("General", "Filter", g_filter);
     writeIntKey("General", "OpenAtStart", g_openAtStartCfg);
+    writeIntKey("General", "ShowFrame", g_showFrame);
     writeIntKey("General", "AutoDetect", g_autoDetect);
     writeIntKey("General", "DefaultLayout", g_defaultLayout);
     writeIntKey("General", "Debug", g_debug);
@@ -164,7 +167,7 @@ static void resetDefaults() {
     g_numRects = sizeof(def) / sizeof(def[0]);
     for (int i = 0; i < g_numRects; i++) g_rects[i] = def[i];
     g_filter = 1; g_autoDetect = 1; g_defaultLayout = 1; g_debug = 0;
-    g_portraitDesktop = -1; g_screenShape = 0; g_openAtStartCfg = 0;
+    g_portraitDesktop = -1; g_screenShape = 0; g_openAtStartCfg = 0; g_showFrame = 1;
     g_refW = 2560; g_refH = 1440; g_canW = 1440; g_canH = 1920;
     g_featherX = 24; g_featherY = 10;
     lstrcpyA(g_bgName, "th06nc-tate-bg.bmp");
@@ -715,7 +718,24 @@ static int buildQuads(Vtx* v, bool layout, int* bgVerts) {
             *bgVerts = n;
         }
         for (int i = 0; i < g_numRects; i++) {
-            const Rect8& r = g_rects[i];
+            Rect8 r = g_rects[i];
+            if (i == 0 && g_showFrame) {
+                // grow the source by the gold frame (16 px at 2560x1440, it holds the boss radar)
+                // and shrink the playfield just enough to fit it in the same destination box
+                int mx = 16 * g_refW / 2560, my = 16 * g_refH / 1440;
+                float ax = (float)r.dw / r.sw, ay = (float)r.dh / r.sh;
+                int sw = r.sw + 2 * mx, sh = r.sh + 2 * my;
+                float f = (float)r.sw / sw;
+                if ((float)r.sh / sh < f) f = (float)r.sh / sh;
+                float dw = sw * ax * f, dh = sh * ay * f;
+                r.dx += (int)((r.dw - dw) * 0.5f); r.dy += (int)((r.dh - dh) * 0.5f);
+                r.dw = (int)(dw + 0.5f); r.dh = (int)(dh + 0.5f);
+                r.sx -= mx; r.sy -= my; r.sw = sw; r.sh = sh;
+            } else if (i == 0 && r.sw > 8 && r.sh > 8) {
+                // zoom in 2 px per side so smooth filtering can't pull in the frame's edge line
+                int mx = 2 * g_refW / 2560, my = 2 * g_refH / 1440;
+                r.sx += mx; r.sy += my; r.sw -= 2 * mx; r.sh -= 2 * my;
+            }
             n = pushQuad(v, n,
                          tx0 + tsx * r.sx / g_refW, ty0 + tsy * r.sy / g_refH,
                          tx0 + tsx * (r.sx + r.sw) / g_refW, ty0 + tsy * (r.sy + r.sh) / g_refH,
@@ -962,6 +982,8 @@ static void overlayBuildUi() {
         if (ImGui::Checkbox("Open this menu at startup", &b)) g_openAtStartCfg = b;
         b = g_force == 1;
         if (ImGui::Checkbox("Force HUD layout (not saved)", &b)) g_force = b ? 1 : -1;
+        b = g_showFrame != 0;
+        if (ImGui::Checkbox("Show gold frame (boss radar)", &b)) g_showFrame = b;
 
         EnterCriticalSection(&g_lock);
         if (ImGui::CollapsingHeader("Gameplay detection")) {

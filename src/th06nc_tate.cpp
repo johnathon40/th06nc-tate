@@ -212,6 +212,7 @@ static ID3D11Buffer*             g_vb;
 static ID3D11SamplerState*       g_smp;
 static ID3D11RasterizerState*    g_rs;
 static ID3D11BlendState*         g_bs;
+static ID3D11BlendState*         g_bsBg;   // background image scaled by the game's fade (blend factor)
 static ID3D11DepthStencilState*  g_dss;
 static ID3D11Texture2D*          g_copy;
 static ID3D11ShaderResourceView* g_copySrv;
@@ -471,6 +472,9 @@ static bool initRenderer(ID3D11Device* dev) {
     bld.RenderTarget[0].BlendOpAlpha = D3D11_BLEND_OP_ADD;
     bld.RenderTarget[0].RenderTargetWriteMask = D3D11_COLOR_WRITE_ENABLE_RED | D3D11_COLOR_WRITE_ENABLE_GREEN | D3D11_COLOR_WRITE_ENABLE_BLUE;
     if (FAILED(dev->CreateBlendState(&bld, &g_bs))) return false;
+    bld.RenderTarget[0].SrcBlend = D3D11_BLEND_BLEND_FACTOR;
+    bld.RenderTarget[0].DestBlend = D3D11_BLEND_ZERO;
+    dev->CreateBlendState(&bld, &g_bsBg);
 
     D3D11_DEPTH_STENCIL_DESC dsd = {};
     dsd.DepthEnable = FALSE;
@@ -558,9 +562,31 @@ static void contentRect() {
 // The New Classic playfield has a gold frame. We read three short pixel strips across
 // its left, right and top edges; all three gold = in game (includes pause/continue).
 static const int kProbe = 30;
+static float g_fade = 1;   // game picture brightness from the frame (1 = normal, 0 = faded to black)
+static bool  g_lastDark;       // previous sample was a black screen
+static bool  g_skipDebounce;   // leave gameplay without waiting (menu fading in from black)
 
-static bool isGold(int r, int g, int b) {
-    return r >= 140 && r > g && g * 100 >= r * 68 && b * 100 <= r * 60;
+static bool goldHue(int r, int g, int b) { return r > g && g * 100 >= r * 68 && b * 100 <= r * 60; }
+static bool isGold(int r, int g, int b) { return r >= 140 && goldHue(r, g, b); }
+static bool isDark(int r, int g, int b) { return r < 48 && g < 48 && b < 48; }
+
+// The frame edge is two gold lines with a dark band between them. That shape survives the game's
+// fade to black (everything dims together), while a menu fading in doesn't have it.
+// px = one probe strip as r,g,b triples.
+static bool frameShape(const int (*px)[3], int n, int* peakOut) {
+    int peak = 0;
+    for (int i = 0; i < n; i++)
+        if (goldHue(px[i][0], px[i][1], px[i][2]) && px[i][0] > peak) peak = px[i][0];
+    *peakOut = peak;
+    if (peak < 24) return false;
+    int lines = 0;
+    bool in = false;
+    for (int i = 0; i < n; i++) {
+        int r = px[i][0];
+        if (!in && r * 10 >= peak * 6 && goldHue(r, px[i][1], px[i][2])) { in = true; lines++; }
+        else if (in && r * 100 < peak * 45) in = false;
+    }
+    return lines >= 2;
 }
 
 static void readPixel(const unsigned char* row, int x, DXGI_FORMAT f, int* r, int* g, int* b) {
@@ -606,7 +632,7 @@ static void copyStrip(ID3D11Texture2D* dst, int dx, int dy, int cx, int cy, bool
     g_ctx->CopySubresourceRegion(dst, 0, dx, dy, 0, g_srcTex, 0, &box);
 }
 
-// returns -1 = no result yet, 0/1 = detected
+// returns -1 = no result yet (or faded / dark: keep the current mode), 0/1 = detected
 static int detectGameplay() {
     if (!detectFormatOk(g_srcFmt) || g_srcW < 64 || g_srcH < 64) return -1;
     ensureStage(g_srcFmt);
@@ -615,9 +641,13 @@ static int detectGameplay() {
     float s = g_cw / 2560.0f, t = g_ch / 1440.0f;
     int ox = (int)g_cx, oy = (int)g_cy;
     ID3D11Texture2D* st = g_stage[g_stageIdx];
-    copyStrip(st, 0, 0,  ox + (int)(699 * s),  oy + (int)(720 * t), false); // left frame edge  -> row 0
-    copyStrip(st, 0, 1,  ox + (int)(1867 * s), oy + (int)(720 * t), false); // right frame edge -> row 1
-    copyStrip(st, 31, 2, ox + (int)(1280 * s), oy + (int)(40 * t),  true);  // top frame edge   -> column 31
+    // side edges at three heights, so text crossing one of them (stage titles, paused) can't hide the frame
+    static const int kSideY[3] = { 400, 720, 1100 };
+    for (int j = 0; j < 3; j++) {
+        copyStrip(st, 0, j * 2,     ox + (int)(699 * s),  oy + (int)(kSideY[j] * t), false); // left  -> rows 0,2,4
+        copyStrip(st, 0, j * 2 + 1, ox + (int)(1867 * s), oy + (int)(kSideY[j] * t), false); // right -> rows 1,3,5
+    }
+    copyStrip(st, 31, 2, ox + (int)(1280 * s), oy + (int)(40 * t),  true);  // top frame edge -> column 31
     g_stageFilled[g_stageIdx] = true;
 
     int readIdx = (g_stageIdx + 1) % 3; // copied two frames ago
@@ -627,15 +657,44 @@ static int detectGameplay() {
     D3D11_MAPPED_SUBRESOURCE m;
     if (FAILED(g_ctx->Map(g_stage[readIdx], 0, D3D11_MAP_READ, D3D11_MAP_FLAG_DO_NOT_WAIT, &m))) return -1;
     const unsigned char* base = (const unsigned char*)m.pData;
-    int r, g, b;
-    bool left = false, right = false, top = false;
+    int px[7][kProbe][3];   // left x3, right x3 (alternating rows 0..5), top (column 31)
     for (int i = 0; i < kProbe; i++) {
-        readPixel(base, i, g_srcFmt, &r, &g, &b);                 if (isGold(r, g, b)) left = true;
-        readPixel(base + m.RowPitch, i, g_srcFmt, &r, &g, &b);    if (isGold(r, g, b)) right = true;
-        readPixel(base + m.RowPitch * (2 + i), 31, g_srcFmt, &r, &g, &b); if (isGold(r, g, b)) top = true;
+        for (int k = 0; k < 7; k++) {
+            int* p = px[k][i];
+            if (k < 6) readPixel(base + m.RowPitch * k, i, g_srcFmt, &p[0], &p[1], &p[2]);
+            else       readPixel(base + m.RowPitch * (2 + i), 31, g_srcFmt, &p[0], &p[1], &p[2]);
+        }
     }
     g_ctx->Unmap(g_stage[readIdx], 0);
-    return (left && right && top) ? 1 : 0;
+
+    // per edge (left, right, top): gold / frame shape if any of its strips shows it, dark if all are dark
+    bool eGold[3] = {}, eShape[3] = {}, eDark[3] = { true, true, true };
+    int peak = 0, anyMax = 0;
+    for (int k = 0; k < 7; k++) {
+        int e = k == 6 ? 2 : (k & 1);
+        int pk;
+        if (frameShape(px[k], kProbe, &pk)) eShape[e] = true;
+        if (pk > peak) peak = pk;
+        for (int i = 0; i < kProbe; i++) {
+            const int* p = px[k][i];
+            if (isGold(p[0], p[1], p[2])) eGold[e] = true;
+            if (!isDark(p[0], p[1], p[2])) eDark[e] = false;
+            for (int c = 0; c < 3; c++) if (p[c] > anyMax) anyMax = p[c];
+        }
+    }
+    bool gold = eGold[0] && eGold[1] && eGold[2];
+    bool shape = eShape[0] && eShape[1] && eShape[2];
+    bool dark = eDark[0] && eDark[1] && eDark[2];
+    bool wasDark = g_lastDark;
+    g_lastDark = dark;
+    g_skipDebounce = false;
+    if (gold) { g_fade = 1; return 1; }
+    // the frame's brightest gold is about 200-220 at full brightness; follow it while it fades
+    if (shape) { float f = peak / 180.0f; g_fade = f > 1 ? 1 : f; return -1; }     // faded frame: keep mode
+    if (dark)  { float f = anyMax / 180.0f; g_fade = f > 1 ? 1 : f; return -1; }   // black: keep mode
+    g_fade = 1;
+    g_skipDebounce = wasDark;   // a menu fading in from black: switch right away
+    return 0;
 }
 
 // ---------------------------------------------------------------- quad building
@@ -794,7 +853,7 @@ static bool layoutActive(int detected) {
     }
     bool now = detected == 1;
     if (now != g_playing) {
-        if (++g_streak >= 8) { // debounce
+        if (++g_streak >= 8 || (!now && g_skipDebounce)) { // debounce
             g_playing = now;
             g_streak = 0;
             g_force = -1;      // detection changed, drop manual override
@@ -1230,8 +1289,13 @@ static void onFrame(IDXGISwapChain* sc) {
         c->OMSetBlendState(g_bs, nullptr, 0xffffffff);
         c->OMSetDepthStencilState(g_dss, 0);
         if (bgVerts > 0) {
+            // dim the background with the game's own fade (death / retry), so the HUD boxes don't stand out
+            float f = (g_autoDetect && g_bsBg) ? g_fade : 1;
+            float bf[4] = { f, f, f, 1 };
+            if (g_bsBg) c->OMSetBlendState(g_bsBg, bf, 0xffffffff);
             c->PSSetShaderResources(0, 1, &g_bgSrv);
             c->Draw(bgVerts, 0);
+            c->OMSetBlendState(g_bs, nullptr, 0xffffffff);
         }
         c->PSSetShaderResources(0, 1, &srcSrv);
         c->Draw(nv - bgVerts, bgVerts);
